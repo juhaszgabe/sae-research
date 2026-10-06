@@ -1,0 +1,134 @@
+seed: 1234
+
+paths:
+  data_root: data              # overridden by env SBM_DATA_ROOT (Drive on Colab)
+  artifact_root: artifacts     # overridden by env SBM_ARTIFACT_ROOT
+
+model:
+  name: gemma-3-1b-it          # key into model_registry; switch to gemma-3-4b-it or gemma-3-270m-it
+  dtype: bfloat16
+  attn_implementation: sdpa
+  device: cuda
+
+model_registry:
+  gemma-3-270m-it:
+    hf_id: google/gemma-3-270m-it
+    auto_class: causal_lm
+    n_layers: 18
+    d_model: 640
+    layers_dense: all                  # "all" = 0..n_layers-1
+    layers_sae: [5, 9, 12, 15]
+    sae_release: gemma-scope-2-270m-it-res
+    sae_release_all: gemma-scope-2-270m-it-res-all
+  gemma-3-1b-it:
+    hf_id: google/gemma-3-1b-it
+    auto_class: causal_lm
+    n_layers: 26
+    d_model: 1152
+    layers_dense: all
+    layers_sae: [7, 13, 17, 22]
+    sae_release: gemma-scope-2-1b-it-res
+    sae_release_all: gemma-scope-2-1b-it-res-all
+  gemma-3-4b-it:
+    hf_id: google/gemma-3-4b-it
+    auto_class: image_text_to_text     # Gemma3ForConditionalGeneration, used text-only
+    n_layers: 34
+    d_model: 2560
+    layers_dense: [1, 5, 9, 13, 17, 20, 22, 25, 29, 33]
+    layers_sae: [9, 17, 22, 29]
+    sae_release: gemma-scope-2-4b-it-res
+    sae_release_all: gemma-scope-2-4b-it-res-all
+
+chat:                                  # makes position finding model-agnostic
+  turn_start_token: "<start_of_turn>"
+  turn_end_token: "<end_of_turn>"
+  stop_tokens: ["<eos>", "<end_of_turn>"]
+
+sae:
+  widths: ["16k"]                      # dev; final runs: ["16k", "65k", "262k"]
+  l0: medium                           # small | medium | big
+  main_width: "262k"                   # used for steering/interpretation once available
+  device: cuda
+  encode_batch_size: 256
+
+behaviors: [refusal, format_break]     # add hedging for TDK
+
+generation:
+  batch_size: 16
+  max_new_tokens: {refusal: 128, format_break: 512, hedging: 128}
+
+extraction:
+  batch_size: 8
+  positions: [user_last, eot_user, turn_start, model_tag, last]
+  pooled: [mean_user]
+  max_prompt_tokens: 1024
+
+refusal_sources:                       # names → HF dataset specs (fields verified at load time)
+  advbench:    {hf_id: walledai/AdvBench, split: train, text_field: prompt, category: harmful, max_n: 300}
+  alpaca:      {hf_id: tatsu-lab/alpaca, split: train, text_field: instruction, filter: {input: ""},
+                min_chars: 20, max_chars: 300, category: harmless, max_n: 350}
+  xstest:      {hf_id: walledai/XSTest, split: test, text_field: prompt, category_field: label,
+                category_map: {safe: borderline_safe, unsafe: harmful}, max_n: null}
+  jbb_harmful: {hf_id: JailbreakBench/JBB-Behaviors, config: behaviors, split: harmful, text_field: Goal,
+                category: harmful, max_n: null}
+  jbb_benign:  {hf_id: JailbreakBench/JBB-Behaviors, config: behaviors, split: benign, text_field: Goal,
+                category: harmless, max_n: null}
+refusal_main_sources: [advbench, alpaca, xstest]
+format_candidates: 1200
+format_topics_per_combo: 3
+
+dataset:
+  target_n: 400
+  pos_frac: 0.5
+  pos_frac_tol: 0.1
+  test_frac: 0.2
+  n_folds: 5
+  n_inner_folds: 3
+  near_dup_jaccard: 0.7
+  exclude_ambiguous: true
+  validation_n: 50
+
+probes:
+  methods: [dim, logreg, dense_topk, sae_topk, sae_all, sae_single, refusal_dir, category_only]
+  logreg_C: [1.0e-4, 1.0e-3, 1.0e-2, 1.0e-1, 1, 10, 100, 1.0e+3, 1.0e+4]
+  dense_topk_C: [1.0e-2, 1.0e-1, 1, 10]
+  sae_C: [1.0e-3, 1.0e-2, 1.0e-1, 1, 10, 100, 1.0e+3]
+  k_grid: [1, 2, 4, 8, 16, 32, 64, 128, 256]
+  selection: mean_diff                 # mean_diff | mutual_info | auroc
+  min_firing_count: 3
+  min_firing_frac: 0.01
+  max_firing_frac: 0.9
+  max_iter: 5000
+
+eval:
+  positions: [last, model_tag, user_last, mean_user]
+  n_bootstrap: 1000
+  ci: 0.95
+  reference: logreg
+  n_jobs: -1
+
+steering:
+  layer: best_sae                      # or an int
+  vectors: [dim, probe_dir, sae_top1, sae_combo5, random0, refusal_dir]
+  add_alphas: [0.0, 0.1, 0.25, 0.5, 1.0]
+  clamp_induce: [1, 2, 4, 8, 16]
+  clamp_suppress: [0, -1, -2, -4]
+  ablate: true
+  positions: all                       # all | prompt | generated
+  n_eval_prompts: 100
+  max_new_tokens: {refusal: 96, format_break: 384, hedging: 96}
+  batch_size: 16
+  coherence_top_n: 10
+  coherence_clamp_alpha: 8.0
+  prompting_baseline: false            # TDK
+
+side_effects:
+  n_mmlu: 300
+  n_ppl: 200
+  ppl_max_tokens: 256
+  batch_size: 8
+
+shifts:                                # TDK
+  style_mix:  {kind: style, styles: [polite_verbose, terse, embedded, roleplay], behaviors: [refusal, format_break]}
+  lang_hu:    {kind: language, styles: [hungarian], behaviors: [refusal, format_break]}
+  source_jbb: {kind: source, sources: [jbb_harmful, jbb_benign], behaviors: [refusal]}
