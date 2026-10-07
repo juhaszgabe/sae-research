@@ -60,6 +60,17 @@ def get_decoder_layers(model: torch.nn.Module, n_layers: int) -> torch.nn.Module
     raise ValueError(f"no decoder ModuleList of length {n_layers} found; ModuleLists (name: length): {found}")
 
 
+def _cached_revision(hf_id: str) -> str | None:
+    """Commit sha of the snapshot the model was just loaded from (the cache path is
+    .../snapshots/<sha>/config.json). transformers 5 no longer keeps it on the config."""
+    from pathlib import Path
+
+    from huggingface_hub import try_to_load_from_cache
+
+    path = try_to_load_from_cache(hf_id, "config.json")
+    return Path(path).parent.name if isinstance(path, str) else None
+
+
 def load_model(cfg: Config) -> ModelBundle:
     """causal_lm → AutoModelForCausalLM; image_text_to_text → Gemma3ForConditionalGeneration.
     torch_dtype from cfg, attn_implementation from cfg, eval(), tokenizer.padding_side='left'.
@@ -103,7 +114,7 @@ def load_model(cfg: Config) -> ModelBundle:
     if any(i is None or i == tokenizer.unk_token_id for i in stop_ids):
         raise AssertionError(f"stop tokens {cfg.get('chat.stop_tokens')} do not all resolve to ids: {stop_ids}")
 
-    revision = getattr(model.config, "_commit_hash", None) or "unknown"
+    revision = getattr(model.config, "_commit_hash", None) or _cached_revision(spec.hf_id) or "unknown"
     log.info("loaded %s (revision %s, %d layers, d_model %d) on %s", spec.hf_id, revision, len(layers), d_model, device)
     return ModelBundle(model, tokenizer, layers, spec, revision, ids, stop_ids, device)
 

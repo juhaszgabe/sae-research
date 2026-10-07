@@ -171,14 +171,21 @@ def check_hooks_vs_hidden_states(bundle: ModelBundle, texts: list[str], atol: fl
 
 def check_padding_equivalence(bundle: ModelBundle, texts: list[str], layer: int) -> dict:
     """`last` vectors from one left-padded batch vs. batch_size=1 runs.
-    ok if max|Δ| / mean|h| < 1e-2 (bf16) or < 1e-5 (float32)."""
+    ok if the largest per-prompt relative error ‖Δ‖₂ / ‖h‖₂ is < 1e-4 (float32) or < 5e-2 (bf16).
+
+    The error is measured against the vector norm, not the mean |h|: Gemma residuals have a few
+    dimensions about 100× larger than the rest, so rounding in those alone exceeds any tight
+    bound relative to the mean. Measured on gemma-3-270m-it (identical in float64, i.e. padding is
+    exact): float32 ≤ 3e-6 and bf16 ≤ 3e-2 from rounding, against ≥ 7e-2 at middle and late layers
+    when the attention mask is ignored."""
     batched = extract(bundle, texts, [layer], positions=("last",), pooled=(), batch_size=len(texts), max_len=10**6)
     single = extract(bundle, texts, [layer], positions=("last",), pooled=(), batch_size=1, max_len=10**6)
-    a, b = batched[layer]["last"], single[layer]["last"]
-    rel = float(np.abs(a - b).max() / (np.abs(b).mean() + 1e-12))
+    a, b = batched[layer]["last"].astype(np.float64), single[layer]["last"].astype(np.float64)
+    rel_rows = np.linalg.norm(a - b, axis=1) / (np.linalg.norm(b, axis=1) + 1e-12)
+    rel = float(rel_rows.max())
     dtype = next(bundle.model.parameters()).dtype
-    tol = 1e-5 if dtype in (torch.float32, torch.float64) else 1e-2
-    return {"rel_max_diff": rel, "tol": tol, "ok": bool(rel < tol)}
+    tol = 1e-4 if dtype in (torch.float32, torch.float64) else 5e-2
+    return {"rel_max_diff": rel, "rel_median_diff": float(np.median(rel_rows)), "tol": tol, "ok": bool(rel < tol)}
 
 
 def check_generation_equivalence(bundle: ModelBundle, texts: list[str], n_tokens: int = 20) -> dict:
