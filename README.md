@@ -21,7 +21,7 @@ at the fixed locations below.
 
 ## Setup
 
-Python 3.11 or 3.12.
+Python 3.11 or newer (developed on 3.11; Colab currently runs 3.13).
 
 ```bash
 pip install -e ".[dev]"
