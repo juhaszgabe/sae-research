@@ -518,33 +518,52 @@ def k_curve(cfg: Config, behavior: str, results: pd.DataFrame) -> pd.DataFrame:
     return out_df
 
 
-def run_controls(cfg: Config, behavior: str, results: pd.DataFrame) -> pd.DataFrame:
-    """At the best `last` layer: shuffled-label logreg and sae_topk (expected AUROC ≈ 0.5; log an
-    ERROR if the CI excludes [0.4, 0.6]) and RandomFeatureProbe with the final k of sae_topk.
-    Saves controls.parquet."""
+def run_controls(cfg: Config, behavior: str, results: pd.DataFrame, n_shuffles: int | None = None) -> pd.DataFrame:
+    """At the best layer of `logreg` and of `sae_topk`: the same probe, with the hyperparameters of its
+    final model, refit on `n_shuffles` independent label shuffles (default `eval.control_shuffles`); for
+    `sae_topk` also as many draws of k random eligible features. One row per draw.
+
+    A single shuffle can land far from 0.5 when one direction dominates the data, because the probe
+    picks it up with a random sign. So only the mean over the shuffles is checked: an ERROR is logged
+    if it differs from 0.5 by more than max(0.05, 3 standard errors). Saves controls.parquet."""
+    n = int(n_shuffles or cfg.get("eval.control_shuffles", 10))
     specs = method_specs(cfg, behavior)
     best = best_layers(results)
-    seed = derive_seed(cfg["seed"], "controls")
     rows = []
 
-    def run(control: str, spec: MethodSpec, r: pd.Series) -> dict:
+    def run(control: str, spec: MethodSpec, r: pd.Series, draw: int, fixed: dict) -> dict:
         layer, position, width = _row_inputs(r)
-        out, _ = _evaluate_config(cfg, behavior, spec, layer, position, width)
-        return {**_identity(behavior, r["method"], layer, position, width), "control": control, **out.row}
+        out, _ = _evaluate_config(cfg, behavior, spec, layer, position, width, fixed=fixed)
+        return {**_identity(behavior, r["method"], layer, position, width), "control": control, "draw": draw, **out.row}
 
     for method in ("logreg", "sae_topk"):
         cand = best[best["method"] == method].sort_values("cv_auroc_mean", ascending=False)
         if cand.empty or method not in specs:
             continue
         r = cand.iloc[0]
-        row = run("shuffled_labels", shuffled_spec(specs[method], seed), r)
-        if row["test_hi"] < 0.4 or row["test_lo"] > 0.6:
-            log.error("shuffled-label control for %s: test AUROC CI [%.3f, %.3f] excludes [0.4, 0.6] — "
-                      "possible leakage", method, row["test_lo"], row["test_hi"])
-        rows.append(row)
+        hparams = json.loads(r["hparams"])
+        shuffled = [
+            run("shuffled_labels", shuffled_spec(specs[method], derive_seed(cfg["seed"], "controls", method, i)), r, i, hparams)
+            for i in range(n)
+        ]
+        rows.extend(shuffled)
+
+        aurocs = np.array([row["test_auroc"] for row in shuffled], dtype=np.float64)
+        aurocs = aurocs[~np.isnan(aurocs)]
+        if len(aurocs):
+            mean = float(aurocs.mean())
+            tol = max(0.05, 3 * float(aurocs.std(ddof=1)) / np.sqrt(len(aurocs))) if len(aurocs) > 1 else 0.1
+            log.info("shuffled-label control for %s: mean test AUROC %.3f over %d shuffles (range %.3f-%.3f)",
+                     method, mean, len(aurocs), aurocs.min(), aurocs.max())
+            if abs(mean - 0.5) > tol:
+                log.error("shuffled-label control for %s: mean test AUROC %.3f over %d shuffles differs from 0.5 "
+                          "by more than %.3f; possible leakage", method, mean, len(aurocs), tol)
+
         if method == "sae_topk":
-            k = json.loads(r["hparams"]).get("k", 16)
-            rows.append(run("random_features", random_feature_spec(cfg, k, seed), r))
+            k = hparams.get("k", 16)
+            for i in range(n):
+                spec = random_feature_spec(cfg, k, derive_seed(cfg["seed"], "controls", "random_features", i))
+                rows.append(run("random_features", spec, r, i, {"C": hparams.get("C", 1.0)}))
 
     out_df = pd.DataFrame(rows)
     write_parquet(out_df, paths(cfg, behavior).results_dir / "controls.parquet")

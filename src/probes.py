@@ -171,7 +171,9 @@ class FeatureSelector(BaseEstimator, TransformerMixin):
         else:
             self.selected_ = ranked[: self.k]
             if len(self.selected_) < self.k:
-                log.warning("only %d eligible features for k=%d; padding with zero columns", len(self.selected_), self.k)
+                # Debug level: this fires once per fit during the grid search. The result still records
+                # the real count as n_features_used.
+                log.debug("only %d eligible features for k=%d; padding with zero columns", len(self.selected_), self.k)
         self.signs_ = signs[self.selected_]
         self.n_features_in_ = n_features
         return self

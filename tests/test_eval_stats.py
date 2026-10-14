@@ -230,3 +230,76 @@ def test_inner_cv_possible():
     assert not ev._inner_cv_possible(y[:6], groups[:6], folds[:6], n_inner=3)  # folds without both classes
     assert not ev._inner_cv_possible(y, np.zeros(60, dtype=int), folds, n_inner=3)  # a single group
     assert not ev._inner_cv_possible(y, groups, np.zeros(60, dtype=int), n_inner=3)  # a single outer fold
+
+
+# --------------------------------------------------------------------------- controls
+
+def _write_sweep_inputs(cfg, ds) -> pd.DataFrame:
+    """Stored activations and SAE codes for layer 1, plus a results table with one logreg and one sae_topk row."""
+    import scipy.sparse as sp
+
+    from src.utils import paths, write_parquet
+
+    p = paths(cfg, "refusal")
+    p.acts_dir.mkdir(parents=True, exist_ok=True)
+    np.savez(p.acts_dir / "layer_01.npz", last=ds.X)
+    index = ds.df[["prompt_id", "split", "fold", "label", "group_id", "prompt_category"]].copy()
+    index.insert(0, "row", np.arange(len(index)))
+    write_parquet(index, p.acts_dir / "index.parquet")
+    codes_dir = p.codes_dir("16k")
+    codes_dir.mkdir(parents=True, exist_ok=True)
+    sp.save_npz(codes_dir / "layer_01_last.npz", ds.codes)
+    return pd.DataFrame([
+        {"method": "logreg", "layer": 1, "position": "last", "width": "dense", "key": ev.config_key("logreg", 1, "last", None),
+         "cv_auroc_mean": 0.9, "hparams": json.dumps({"C": 1.0})},
+        {"method": "sae_topk", "layer": 1, "position": "last", "width": "16k", "key": ev.config_key("sae_topk", 1, "last", "16k"),
+         "cv_auroc_mean": 0.9, "hparams": json.dumps({"C": 1.0, "k": 4}, sort_keys=True)},
+    ])
+
+
+@pytest.fixture
+def eval_log(caplog):
+    """Captures the sbm.eval log (the sbm loggers do not propagate to the root logger)."""
+    import logging
+
+    logger = logging.getLogger("sbm.eval")
+    caplog.set_level(logging.INFO, logger="sbm.eval")
+    chain, node = [], logger  # the loggers a record from sbm.eval passes through
+    while node is not None:
+        chain.append(node)
+        node = node.parent if node.propagate else None
+    added = not any(caplog.handler in n.handlers for n in chain)  # newer pytest attaches it already
+    if added:
+        logger.addHandler(caplog.handler)
+    yield caplog
+    if added:
+        logger.removeHandler(caplog.handler)
+
+
+def test_run_controls_averages_over_shuffles(tiny_cfg, synthetic_dataset, eval_log):
+    from src.utils import paths
+
+    results = _write_sweep_inputs(tiny_cfg, synthetic_dataset)
+    out = ev.run_controls(tiny_cfg, "refusal", results, n_shuffles=6)
+
+    assert (paths(tiny_cfg, "refusal").results_dir / "controls.parquet").exists()
+    assert out.groupby(["method", "control"]).size().to_dict() == {
+        ("logreg", "shuffled_labels"): 6, ("sae_topk", "random_features"): 6, ("sae_topk", "shuffled_labels"): 6}
+    assert sorted(out["draw"].unique()) == list(range(6))
+    # the final model's hyperparameters are reused, so no search runs inside the control
+    assert set(out.loc[out["method"] == "logreg", "hparams"]) == {json.dumps({"C": 1.0})}
+    for method in ("logreg", "sae_topk"):
+        shuffled = out[(out["method"] == method) & (out["control"] == "shuffled_labels")]["test_auroc"]
+        assert abs(shuffled.mean() - 0.5) < 0.2, shuffled.tolist()
+        assert shuffled.nunique() > 1  # each draw uses its own shuffle
+    assert "mean test AUROC" in eval_log.text
+    assert not [r for r in eval_log.records if r.levelname == "ERROR"]
+
+
+def test_run_controls_flags_a_leak(tiny_cfg, synthetic_dataset, eval_log, monkeypatch):
+    results = _write_sweep_inputs(tiny_cfg, synthetic_dataset)
+    # simulate a leak: the "shuffled" control silently trains on the real labels
+    monkeypatch.setattr(ev, "shuffled_spec", lambda spec, seed: spec)
+    ev.run_controls(tiny_cfg, "refusal", results.iloc[:1], n_shuffles=3)
+    errors = [r.getMessage() for r in eval_log.records if r.levelname == "ERROR"]
+    assert len(errors) == 1 and "possible leakage" in errors[0]

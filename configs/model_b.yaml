@@ -105,6 +105,7 @@ eval:
   n_bootstrap: 1000
   ci: 0.95
   reference: logreg
+  control_shuffles: 10                 # shuffled-label / random-feature draws per control
   n_jobs: -1
 
 steering:
