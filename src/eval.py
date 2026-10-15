@@ -524,8 +524,10 @@ def run_controls(cfg: Config, behavior: str, results: pd.DataFrame, n_shuffles: 
     `sae_topk` also as many draws of k random eligible features. One row per draw.
 
     A single shuffle can land far from 0.5 when one direction dominates the data, because the probe
-    picks it up with a random sign. So only the mean over the shuffles is checked: an ERROR is logged
-    if it differs from 0.5 by more than max(0.05, 3 standard errors). Saves controls.parquet."""
+    picks it up with a random sign (on the 270M refusal data the spread between shuffles is about 0.12).
+    So only the mean over the shuffles is checked: an ERROR is logged if it differs from 0.5 by more than
+    max(0.1, 3 standard errors). The 0.1 floor matters with few shuffles, whose spread can look
+    deceptively small. Saves controls.parquet."""
     n = int(n_shuffles or cfg.get("eval.control_shuffles", 10))
     specs = method_specs(cfg, behavior)
     best = best_layers(results)
@@ -552,7 +554,7 @@ def run_controls(cfg: Config, behavior: str, results: pd.DataFrame, n_shuffles: 
         aurocs = aurocs[~np.isnan(aurocs)]
         if len(aurocs):
             mean = float(aurocs.mean())
-            tol = max(0.05, 3 * float(aurocs.std(ddof=1)) / np.sqrt(len(aurocs))) if len(aurocs) > 1 else 0.1
+            tol = max(0.1, 3 * float(aurocs.std(ddof=1)) / np.sqrt(len(aurocs))) if len(aurocs) > 1 else 0.1
             log.info("shuffled-label control for %s: mean test AUROC %.3f over %d shuffles (range %.3f-%.3f)",
                      method, mean, len(aurocs), aurocs.min(), aurocs.max())
             if abs(mean - 0.5) > tol:
