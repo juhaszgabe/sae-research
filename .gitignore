@@ -219,3 +219,14 @@ __marimo__/
 
 # My personal .md notes
 /plans
+
+# Experiment outputs (sae-behavior-monitor)
+data/
+artifacts/
+*.pt
+*.safetensors
+*.npz
+*.npy
+*.parquet
+*.joblib
+wandb/

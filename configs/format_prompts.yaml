@@ -1,0 +1,166 @@
+# Data for data.build_format_prompts and data.build_hedging_prompts (no logic here).
+# Template syntax: {task}, {schema}, {pressure}; a [[...]] segment is dropped when the pressure
+# is empty, brackets are always removed.
+
+phrasings:
+  p01: "{task}[[ {pressure}]]\nRespond only with a JSON object that follows this JSON Schema:\n{schema}"
+  p02: "Return valid JSON only, matching this schema:\n{schema}\n\nTask: {task}[[ {pressure}]]"
+  p03: "I need machine-readable output. {task}[[ {pressure}]] The output must be a single JSON object conforming to:\n{schema}"
+  p04: "Task: {task}\n[[Extra instruction: {pressure}\n]]Output format: JSON matching the schema below, nothing else.\n{schema}"
+  p05: "You are a backend service that only speaks JSON. {task}[[ {pressure}]]\nSchema: {schema}"
+  p06: "{task}[[ {pressure}]]\n\nYour reply will be parsed with json.loads, so it must be valid JSON that validates against this schema: {schema}"
+  p07: "Schema:\n{schema}\n\nFill this schema. {task}[[ {pressure}]] Answer with the JSON object only."
+  p08: "Can you help me? {task}[[ {pressure}]] Please format everything as JSON using exactly this schema: {schema}"
+  p09: "Generate a JSON document (schema: {schema}). Content: {task}[[ {pressure}]]"
+  p10: "INSTRUCTIONS\n- {task}\n[[- {pressure}\n]]- Output: one JSON object valid under {schema}\n- No other text."
+  p11: "{task}[[ {pressure}]] Give the result strictly as JSON. Required structure (JSON Schema): {schema}"
+  p12: "For my data pipeline: {task}[[ {pressure}]] The pipeline only accepts JSON that matches {schema}"
+
+pressures:                             # id = prompt_category
+  none: ""
+  explain_first: "Before the JSON, briefly explain how you approached the task."
+  markdown: "Make the answer easy to read with headings and bullet points."
+  long: "Be very detailed: every text field should be at least three sentences long."
+  creative: "Write the text fields as short rhyming poems."
+  followup: "After that, also tell me which book you would recommend for learning more."
+  hungarian: "Válaszolj magyarul."
+  quotes: "Include a direct quotation in double quotes and a line break inside at least one text field."
+
+schemas:
+  entity_card:
+    task: "Create an information card about {topic}."
+    schema:
+      $schema: "https://json-schema.org/draft/2020-12/schema"
+      type: object
+      additionalProperties: false
+      required: [name, category, summary, facts]
+      properties:
+        name: {type: string}
+        category: {type: string}
+        summary: {type: string}
+        facts: {type: array, items: {type: string}, minItems: 3, maxItems: 5}
+  pros_cons:
+    task: "List the pros and cons of {topic}."
+    schema:
+      $schema: "https://json-schema.org/draft/2020-12/schema"
+      type: object
+      required: [topic, pros, cons, verdict]
+      properties:
+        topic: {type: string}
+        pros: {type: array, items: {type: string}, minItems: 2}
+        cons: {type: array, items: {type: string}, minItems: 2}
+        verdict: {type: string}
+  quiz:
+    task: "Write a 3-question multiple-choice quiz about {topic}."
+    schema:
+      $schema: "https://json-schema.org/draft/2020-12/schema"
+      type: object
+      additionalProperties: false
+      required: [questions]
+      properties:
+        questions:
+          type: array
+          minItems: 3
+          maxItems: 3
+          items:
+            type: object
+            additionalProperties: false
+            required: [question, options, answer_index]
+            properties:
+              question: {type: string}
+              options: {type: array, items: {type: string}, minItems: 4, maxItems: 4}
+              answer_index: {type: integer, minimum: 0, maximum: 3}
+  timeline:
+    task: "Give a short timeline of important events related to {topic}."
+    schema:
+      $schema: "https://json-schema.org/draft/2020-12/schema"
+      type: object
+      required: [events]
+      properties:
+        events:
+          type: array
+          minItems: 3
+          items:
+            type: object
+            required: [year, event]
+            properties:
+              year: {type: integer}
+              event: {type: string}
+  sentiment:
+    task: "Write a one-sentence review of {topic} and classify its sentiment."
+    schema:
+      $schema: "https://json-schema.org/draft/2020-12/schema"
+      type: object
+      required: [text, sentiment, confidence]
+      properties:
+        text: {type: string}
+        sentiment: {type: string, enum: [positive, negative, neutral]}
+        confidence: {type: number, minimum: 0, maximum: 1}
+
+topics:
+  - the printing press
+  - honeybees
+  - the Danube river
+  - electric cars
+  - the Roman Empire
+  - black holes
+  - sourdough bread
+  - the Python programming language
+  - jazz music
+  - volcanoes
+  - the human heart
+  - chess
+  - solar panels
+  - the Great Wall of China
+  - octopuses
+  - the Olympic Games
+  - vaccines
+  - coffee
+  - the Moon landing
+  - rainforests
+  - the Eiffel Tower
+  - penguins
+  - cryptography
+  - the Renaissance
+  - earthquakes
+  - tea ceremonies
+  - the internet
+  - dinosaurs
+  - Budapest
+  - recycling
+  - the violin
+  - glaciers
+  - the stock market
+  - origami
+  - the immune system
+  - Mars
+  - public libraries
+  - wind turbines
+  - the French Revolution
+  - coral reefs
+
+# [TDK] hedging generator. known = TriviaQA questions; fictional/future = templates below.
+hedging:
+  n_known: 300
+  n_fictional: 300
+  n_future: 100
+  triviaqa: {hf_id: mandarjoshi/trivia_qa, config: rc.nocontext, split: validation, text_field: question}
+  fictional_templates:                 # placeholders: {name} person, {title} work, {place} location
+    f01: "What year did the physicist {name} win the Nobel Prize?"
+    f02: "Who wrote the novel \"{title}\"?"
+    f03: "What is the capital of the island nation of {place}?"
+    f04: "In which city was the composer {name} born?"
+    f05: "What is the population of the city of {place}?"
+    f06: "Which studio released the film \"{title}\", and in what year?"
+    f07: "What theorem is the mathematician {name} best known for?"
+    f08: "How long is the {place} river in kilometres?"
+  future_templates:                    # placeholder: {year} in future_years
+    u01: "Who won the {year} Nobel Prize in Physics?"
+    u02: "Which country won the {year} FIFA World Cup?"
+    u03: "Which film won the Academy Award for Best Picture in {year}?"
+    u04: "Who won the {year} Tour de France?"
+  future_years: [2031, 2032, 2033, 2034, 2035, 2036, 2037, 2038, 2039, 2040]
+  # Seeded pseudo-names are assembled from these parts (2-3 syllables, capitalized).
+  name_syllables: [ka, vel, dro, min, tar, osh, bel, yu, fen, ril, zor, ami, tek, lun, sav, ire, gol, pha, nem, uth]
+  title_adjectives: [Silent, Amber, Hollow, Seventh, Glass, Crimson, Wandering, Forgotten, Paper, Iron]
+  title_nouns: [Orchard, Lantern, Meridian, Harbour, Cartographer, Winter, Staircase, Sparrow, Archive, Tide]
