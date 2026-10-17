@@ -243,8 +243,9 @@ def test_make_specs(real_cfg):
     slugs = [s.slug() for s in specs]
     assert len(slugs) == len(set(slugs))  # every spec has its own generation cache
     kinds = pd.Series([s.kind for s in specs]).value_counts().to_dict()
-    # 6 vectors × 5 alphas × 2 directions; 5 + 4 clamp values; ablate dim + refusal_dir; none × 2
-    assert kinds == {"add": 60, "clamp": 9, "ablate": 2, "none": 2}
+    # 6 vectors × 4 non-zero alphas × 2 directions; 5 + 4 clamp values; ablate dim + refusal_dir; none × 2
+    assert kinds == {"add": 48, "clamp": 9, "ablate": 2, "none": 2}
+    assert not any(s.kind == "add" and s.alpha == 0 for s in specs)  # α = 0 is the unsteered run
     assert any(s.vector == "random0" for s in specs)  # R6: a random-direction control is always there
     assert all(s.alpha >= 0 for s in specs if s.kind == "add" and s.direction == "induce")
     assert all(s.alpha <= 0 for s in specs if s.kind == "add" and s.direction == "suppress")
@@ -322,3 +323,122 @@ def test_direction_coherence():
     assert dim["alpha_at_budget"] == pytest.approx(0.25) and dim["effect_at_budget"] == pytest.approx(0.40)
     assert out.loc[("dim", "suppress"), "effect_at_budget"] == pytest.approx(0.50)
     assert np.isnan(out.loc[("random0", "induce"), "effect_at_budget"])  # no α within the budget
+
+
+def test_direction_coherence_starts_at_the_origin():
+    # α = 0 is no longer generated; the area must still be measured from (0, 0)
+    sweep, side = _sweep_and_side()
+    with_zero = pd.concat([sweep, pd.DataFrame([{"slug": "z", "kind": "add", "direction": "induce", "vector": "dim",
+                                                 "alpha": 0.0, "delta_rate": 0.0}])], ignore_index=True)
+    side_zero = pd.concat([side, pd.DataFrame([{"slug": "z", "delta_mmlu": 0.0}])], ignore_index=True)
+    a = st.direction_coherence(sweep, side).set_index(["vector", "direction"])
+    b = st.direction_coherence(with_zero, side_zero).set_index(["vector", "direction"])
+    assert a.loc[("dim", "induce"), "auc_abs_delta"] == pytest.approx(b.loc[("dim", "induce"), "auc_abs_delta"])
+    assert a.loc[("dim", "induce"), "auc_abs_delta"] == pytest.approx(0.25 * 0.2 + 0.25 * 0.5)
+
+
+# --------------------------------------------------------------------------- layer choice / caches
+
+def _results(rows):
+    return pd.DataFrame([{"method": m, "position": q, "layer": layer, "width": w, "cv_auroc_mean": cv}
+                         for m, q, layer, w, cv in rows])
+
+
+def test_choose_layer(real_cfg):
+    sae_rows = _results([("sae_topk", "last", 13, "65k", 0.90), ("sae_topk", "last", 17, "65k", 0.95),
+                         ("sae_topk", "last", 7, "262k", 0.80), ("logreg", "last", 22, "dense", 0.99)])
+    # the main width (262k) is preferred when it was evaluated, otherwise the widest available
+    assert st.choose_layer(real_cfg, sae_rows) == 7
+    assert st.choose_layer(real_cfg, sae_rows[sae_rows["width"] != "262k"]) == 17
+
+    # no SAE probes yet: the best logreg layer among the SAE layers (22 is one of them, 25 is not)
+    dense_only = _results([("logreg", "last", 13, "dense", 0.90), ("logreg", "last", 22, "dense", 0.95),
+                           ("logreg", "last", 25, "dense", 0.99), ("logreg", "model_tag", 7, "dense", 0.999)])
+    assert st.choose_layer(real_cfg, dense_only) == 22
+    with pytest.raises(ValueError, match="run_probes"):
+        st.choose_layer(real_cfg, _results([("dim", "last", 13, "dense", 0.9)]))
+
+
+@pytest.fixture
+def steer_cfg(tmp_path, monkeypatch):
+    """The tiny model with short generations and a small side-effect set."""
+    from conftest import CONFIG_PATH, TINY_REGISTRY
+
+    from src.config import load_config
+
+    monkeypatch.setenv("SBM_DATA_ROOT", str(tmp_path / "data"))
+    monkeypatch.setenv("SBM_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    return load_config(CONFIG_PATH, **{
+        "model_registry.tiny-it": dict(TINY_REGISTRY), "model.name": "tiny-it", "model.device": "cpu",
+        "eval.n_bootstrap": 50, "steering.max_new_tokens": {"refusal": 4}, "steering.batch_size": 4,
+        "side_effects.n_mmlu": 6, "side_effects.n_ppl": 3, "side_effects.ppl_max_tokens": 12, "side_effects.batch_size": 3,
+    })
+
+
+def _prompt_sets(n=3):
+    texts = random_texts(n, seed=7)
+    df = pd.DataFrame({"prompt_id": [f"p{i}" for i in range(n)], "text": texts, "json_schema": [None] * n})
+    return {"induce": df, "suppress": df}
+
+
+def test_fingerprint_changes_with_everything_that_matters(bundle, vectors):
+    spec = st.SteerSpec("add", "induce", LAYER, "dim", 0.5)
+    fp = lambda **kw: st._fingerprint(bundle, kw.pop("spec", spec), kw.pop("vectors", vectors), kw.pop("n_ref", N_REF),
+                                      None, None, **{"behavior": "refusal", "max_new_tokens": 4, **kw})
+    base = fp()
+    assert base == fp()
+    other = {**vectors, "dim": vectors["probe_dir"]}  # same name, different direction (e.g. another SAE width)
+    assert fp(vectors=other) != base
+    assert fp(n_ref=N_REF * 2) != base
+    assert fp(max_new_tokens=8) != base
+    assert fp(spec=st.SteerSpec("add", "induce", LAYER, "dim", 0.25)) != base
+
+
+def test_generation_cache_is_not_reused_for_a_different_vector(bundle, steer_cfg, vectors):
+    sets = _prompt_sets()
+    specs = [st.SteerSpec("add", "induce", LAYER, "dim", 20.0)]
+    a = st.run_steering_sweep(bundle, steer_cfg, "refusal", specs, sets, vectors, N_REF)
+    again = st.run_steering_sweep(bundle, steer_cfg, "refusal", specs, sets, vectors, N_REF)
+    other = st.run_steering_sweep(bundle, steer_cfg, "refusal", specs, sets, {**vectors, "dim": vectors["probe_dir"]}, N_REF)
+
+    cache = utils_cache(steer_cfg, specs[0])
+    assert a.set_index("slug")["fingerprint"].equals(again.set_index("slug")["fingerprint"])  # identical run: reused
+    none_a, none_b = (df[df["kind"] == "none"].set_index("slug")["fingerprint"] for df in (a, other))
+    assert none_a.equals(none_b)  # the unsteered runs do not depend on the vector
+    # the same slug now holds two sets of responses, one per vector
+    slug = specs[0].slug()
+    fp_a = a.set_index("slug").loc[slug, "fingerprint"]
+    fp_b = other.set_index("slug").loc[slug, "fingerprint"]
+    assert fp_a != fp_b
+    assert all(f"p{i}:{fp_a}" in cache and f"p{i}:{fp_b}" in cache for i in range(3))
+
+
+def utils_cache(cfg, spec):
+    from src.utils import JsonlCache, paths
+
+    return JsonlCache(paths(cfg, "refusal").steering_dir / "generations" / f"{spec.slug()}.jsonl")
+
+
+def test_side_effects_are_cached(bundle, steer_cfg, vectors, monkeypatch):
+    from src.utils import paths, write_jsonl
+
+    se_dir = paths(steer_cfg, "refusal").side_effects_dir
+    write_jsonl(se_dir / "mmlu_subset.jsonl", [{"question": "w1 w2", "choices": ["w3", "w4", "w5", "w6"], "answer": i % 4,
+                                                "subject": "s"} for i in range(6)])
+    write_jsonl(se_dir / "wikitext_passages.jsonl", [{"text": " ".join(random_texts(1, seed=i, min_words=20, max_words=20))}
+                                                     for i in range(3)])
+    specs = [st.SteerSpec("none", "induce"), st.SteerSpec("add", "induce", LAYER, "dim", 0.5),
+             st.SteerSpec("ablate", "suppress", None, "dim")]
+    calls = []
+    real = st.mmlu_accuracy
+    monkeypatch.setattr(st, "mmlu_accuracy", lambda *a, **k: calls.append(1) or real(*a, **k))
+
+    first = st.run_side_effects(bundle, steer_cfg, "refusal", specs, vectors, N_REF)
+    n_first = len(calls)
+    second = st.run_side_effects(bundle, steer_cfg, "refusal", specs, vectors, N_REF)
+    assert n_first == 3  # unsteered baseline + two interventions
+    assert len(calls) == n_first  # the re-run measured nothing again
+    pd.testing.assert_frame_equal(first, second)
+
+    st.run_side_effects(bundle, steer_cfg, "refusal", specs, {**vectors, "dim": vectors["probe_dir"]}, N_REF)
+    assert len(calls) == n_first + 2  # a different vector is measured again, the baseline is not

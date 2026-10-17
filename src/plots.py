@@ -186,13 +186,15 @@ def plot_steering_curves(sweep: pd.DataFrame, direction: str, out: Path | None =
     """Behavior rate vs α per vector."""
     df = sweep[sweep["direction"] == direction]
     fig, ax = plt.subplots(figsize=(6.5, 4.5))
+    none = df[df["kind"] == "none"]
     for vector, g in df[df["kind"] == "add"].groupby("vector", sort=True):
         g = g.assign(abs_alpha=g["alpha"].abs()).sort_values("abs_alpha")
+        if not none.empty and (g["abs_alpha"] != 0).all():  # α = 0 is the unsteered run: start each curve there
+            g = pd.concat([none.iloc[[0]].assign(abs_alpha=0.0, vector=vector), g], ignore_index=True)
         color, marker = _style("random0" if str(vector).startswith("random") else str(vector))
         ax.errorbar(g["abs_alpha"], g["behavior_rate"],
                     yerr=[g["behavior_rate"] - g["rate_lo"], g["rate_hi"] - g["behavior_rate"]],
                     color=color, marker=marker, capsize=2, label=vector)
-    none = df[df["kind"] == "none"]
     if not none.empty:
         ax.axhline(none["behavior_rate"].iloc[0], color="black", linestyle=":", linewidth=0.8, label="unsteered")
     prompt = df[df["kind"] == "prompt"]

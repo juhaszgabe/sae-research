@@ -6,6 +6,8 @@ Steering results always come with side effects and a random-direction control (R
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import json
 import random
 from collections import Counter
 from contextlib import ExitStack, contextmanager, nullcontext
@@ -155,13 +157,23 @@ def _normalize(v: np.ndarray) -> np.ndarray:
 
 def choose_layer(cfg: Config, results: pd.DataFrame) -> int:
     """cfg steering.layer if int, else the best sae_topk layer at `last` (main_width if evaluated,
-    else the widest available) by cv_auroc_mean."""
+    else the widest available) by cv_auroc_mean. Without sae_topk results at `last` (SAE probes not
+    fitted yet) it falls back to the best logreg layer at `last` among the SAE layers, with a warning;
+    the run then has no SAE vectors or clamps. Raises if neither exists."""
     layer = cfg.get("steering.layer")
     if isinstance(layer, int) and not isinstance(layer, bool):
         return layer
     sub = results[(results["method"] == "sae_topk") & (results["position"] == "last")]
     if sub.empty:
-        raise ValueError("steering.layer is 'best_sae' but there are no sae_topk results at position 'last'")
+        dense = results[(results["method"] == "logreg") & (results["position"] == "last")
+                        & results["layer"].isin(cfg.model.layers_sae)]
+        if dense.empty:
+            raise ValueError("steering.layer is 'best_sae' but there are no sae_topk or logreg results at position "
+                             "'last' on the SAE layers; run run_probes.py first or set steering.layer")
+        best = int(dense.sort_values(["cv_auroc_mean", "layer"], ascending=[False, True]).iloc[0]["layer"])
+        log.warning("no sae_topk results at position 'last': steering at the best logreg layer %d instead, "
+                    "without SAE vectors or clamps", best)
+        return best
     widths = set(sub["width"])
     main = cfg.get("sae.main_width")
     width = main if main in widths else max(widths, key=lambda w: WIDTHS.get(w, 0))
@@ -254,7 +266,8 @@ def eval_prompt_sets(cfg: Config, behavior: str, n: int | None = None) -> dict[s
 
 
 def make_specs(cfg: Config, behavior: str, layer: int, sae_top1_feature: int | None) -> list[SteerSpec]:
-    """none (both directions); add for every vector × add_alphas (sign by direction);
+    """none (both directions); add for every vector × the non-zero add_alphas (sign by direction;
+    α = 0 is identical to `none`, which serves as each curve's origin);
     clamp for sae_top1 × clamp_induce / clamp_suppress; ablate(dim, refusal_dir) for suppress if
     enabled; prompt for both directions if prompting_baseline."""
     sc = cfg["steering"]
@@ -265,6 +278,8 @@ def make_specs(cfg: Config, behavior: str, layer: int, sae_top1_feature: int | N
     for vector in vector_names:
         for direction, sign in (("induce", 1.0), ("suppress", -1.0)):
             for alpha in sc["add_alphas"]:
+                if float(alpha) == 0.0:
+                    continue
                 specs.append(SteerSpec("add", direction, layer, vector, sign * float(alpha) + 0.0, None, positions))  # + 0.0: no -0.0
     if sae_top1_feature is not None:
         for direction, alphas in (("induce", sc["clamp_induce"]), ("suppress", sc["clamp_suppress"])):
@@ -298,25 +313,46 @@ def is_degenerate(text: str, response_token_ids: Sequence[int] | None, max_new_t
     return False
 
 
+def _fingerprint(bundle: ModelBundle, spec: SteerSpec, vectors: dict[str, np.ndarray], n_ref: float,
+                 sae: JumpReLUSAE | None, a_ref: np.ndarray | None, **settings) -> str:
+    """Short hash of everything that determines a steered output: the spec, the model revision and
+    dtype, the actual vector (so another SAE width or source position never reuses a cached result),
+    n_ref, the clamped feature's decoder row and target, and the caller's settings."""
+    d = {"spec": dataclasses.asdict(spec), "revision": bundle.revision,
+         "dtype": str(next(bundle.model.parameters()).dtype), **settings}
+    if spec.kind in ("add", "ablate") and spec.vector in vectors:
+        d["vector"] = hashlib.sha1(np.ascontiguousarray(vectors[spec.vector], dtype=np.float32).tobytes()).hexdigest()
+    if spec.kind == "add":
+        d["n_ref"] = float(n_ref)
+    if spec.kind == "clamp" and sae is not None and a_ref is not None and spec.feature is not None:
+        i = int(spec.feature)
+        d["sae"] = f"{sae.info.release}/{sae.info.sae_id}" if sae.info is not None else None
+        d["decoder_row"] = hashlib.sha1(sae.W_dec[i].detach().float().cpu().numpy().tobytes()).hexdigest()
+        d["target"] = float(spec.alpha) * float(a_ref[i])
+    return hashlib.sha1(json.dumps(d, sort_keys=True, default=str).encode("utf-8")).hexdigest()[:16]
+
+
 def _wrap(behavior: str, spec: SteerSpec, text: str) -> str:
     return PROMPT_TEMPLATES[behavior][spec.direction].replace("{text}", text) if spec.kind == "prompt" else text
 
 
 def _generate_cached(bundle: ModelBundle, cfg: Config, behavior: str, spec: SteerSpec, prompts: pd.DataFrame,
-                     factory: Callable[[], ContextManager]) -> list[dict]:
-    """Generations of one spec on its prompts, cached per prompt_id in generations/{slug}.jsonl."""
+                     factory: Callable[[], ContextManager], fingerprint: str) -> list[dict]:
+    """Generations of one spec on its prompts, cached in generations/{slug}.jsonl under
+    "{prompt_id}:{fingerprint}", so a cached response is reused only for the identical intervention."""
     cache = JsonlCache(paths(cfg, behavior).steering_dir / "generations" / f"{spec.slug()}.jsonl")
     max_new = cfg.get(f"steering.max_new_tokens.{behavior}")
     batch_size = cfg.get("steering.batch_size")
-    todo = prompts[~prompts["prompt_id"].isin([pid for pid in prompts["prompt_id"] if pid in cache])]
+    key = {pid: f"{pid}:{fingerprint}" for pid in prompts["prompt_id"]}
+    todo = prompts[~prompts["prompt_id"].map(lambda pid: key[pid] in cache)]
     todo = todo.iloc[np.argsort(-todo["text"].str.len().to_numpy(), kind="stable")]
     for start in range(0, len(todo), batch_size):
         batch = todo.iloc[start:start + batch_size]
         outs = model_lib.generate(bundle, [_wrap(behavior, spec, t) for t in batch["text"]], max_new, batch_size,
                                   intervention=factory, show_progress=False)
         for pid, out in zip(batch["prompt_id"], outs):
-            cache.put(pid, {k: out[k] for k in ("response", "response_token_ids", "response_n_tokens", "finish_reason")})
-    return [cache.get(pid) for pid in prompts["prompt_id"]]
+            cache.put(key[pid], {k: out[k] for k in ("response", "response_token_ids", "response_n_tokens", "finish_reason")})
+    return [cache.get(key[pid]) for pid in prompts["prompt_id"]]
 
 
 def _sweep(bundle: ModelBundle, cfg: Config, behavior: str, specs: list[SteerSpec],
@@ -328,6 +364,7 @@ def _sweep(bundle: ModelBundle, cfg: Config, behavior: str, specs: list[SteerSpe
     specs = [SteerSpec("none", d) for d in ("induce", "suppress")] + [s for s in specs if s.kind != "none"]
     baseline: dict[str, np.ndarray] = {}
     rows, seen = [], set()
+    sae_id = f"{sae.info.release}/{sae.info.sae_id}" if sae is not None and sae.info is not None else None
 
     for spec in tqdm(specs, desc=f"steering {behavior}"):
         slug = spec.slug()
@@ -338,7 +375,11 @@ def _sweep(bundle: ModelBundle, cfg: Config, behavior: str, specs: list[SteerSpe
         if spec.kind in ("add", "ablate") and spec.vector not in vectors:
             log.warning("skipping %s: vector %r not available", slug, spec.vector)
             continue
-        gens = _generate_cached(bundle, cfg, behavior, spec, prompts, intervention(bundle, spec, vectors, n_ref, sae, a_ref))
+        fp = _fingerprint(bundle, spec, vectors, n_ref, sae, a_ref, behavior=behavior, max_new_tokens=max_new,
+                          batch_size=cfg.get("steering.batch_size"),
+                          template=PROMPT_TEMPLATES[behavior][spec.direction] if spec.kind == "prompt" else None)
+        factory = intervention(bundle, spec, vectors, n_ref, sae, a_ref)
+        gens = _generate_cached(bundle, cfg, behavior, spec, prompts, factory, fp)
         labels = np.array([
             label_one(behavior, {"response": g["response"], "json_schema": js, "finish_reason": g["finish_reason"]}).label
             for g, js in zip(gens, prompts["json_schema"])
@@ -349,7 +390,7 @@ def _sweep(bundle: ModelBundle, cfg: Config, behavior: str, specs: list[SteerSpe
         rate, lo, hi = bootstrap_rate(labels, n_boot, seed, ci)
         delta = paired_rate_delta(labels, baseline[spec.direction], n_boot, seed, ci)
         rows.append({
-            "slug": slug, **dataclasses.asdict(spec), "n": int(len(labels)),
+            "slug": slug, **dataclasses.asdict(spec), "sae_id": sae_id, "fingerprint": fp, "n": int(len(labels)),
             "behavior_rate": rate, "rate_lo": lo, "rate_hi": hi,
             "delta_rate": delta["delta"], "delta_lo": delta["lo"], "delta_hi": delta["hi"], "delta_p": delta["p"],
             "degenerate_rate": float(np.mean([is_degenerate(g["response"], g["response_token_ids"], max_new) for g in gens])),
@@ -367,7 +408,8 @@ def run_steering_sweep(bundle: ModelBundle, cfg: Config, behavior: str, specs: l
                        n_ref: float, sae: JumpReLUSAE | None = None,
                        a_ref: np.ndarray | None = None) -> pd.DataFrame:
     """For each spec: generate (greedy, steering.max_new_tokens) on its direction's prompts
-    (cached per spec in steering_dir/generations/{slug}.jsonl), label with labeling.label_one,
+    (cached in steering_dir/generations/{slug}.jsonl under an intervention fingerprint, so another
+    width, vector or setting never reuses a stale response), label with labeling.label_one,
     compute behavior_rate (+CI), delta_rate vs the same direction's `none` spec (paired CI),
     degenerate_rate, mean_response_tokens. Saves/returns sweep.parquet."""
     out = _sweep(bundle, cfg, behavior, specs, prompt_sets, vectors, n_ref, sae, a_ref)
@@ -527,13 +569,30 @@ def nll_kl(bundle: ModelBundle, texts: list[str], intervention: Callable[[], Con
 def run_side_effects(bundle: ModelBundle, cfg: Config, behavior: str, specs: list[SteerSpec],
                      vectors, n_ref, sae=None, a_ref=None) -> pd.DataFrame:
     """Per spec: mmlu_acc (+CI), delta_mmlu vs unsteered (paired CI), nll, delta_nll, kl_mean.
-    Saves side_effects.parquet."""
+    The per-question MMLU correctness and the NLL/KL of every intervention are cached in
+    steering_dir/side_effects_cache.jsonl under an intervention fingerprint, so a re-run only measures
+    what is new. Saves side_effects.parquet."""
     se = cfg["side_effects"]
     n_boot, ci = cfg.get("eval.n_bootstrap"), cfg.get("eval.ci")
     seed = derive_seed(cfg["seed"], "side_effects")
     questions, passages = load_mmlu_subset(cfg), load_wikitext(cfg)
-    base_correct = mmlu_accuracy(bundle, questions, None, None, se["batch_size"])
-    base_nll = nll_kl(bundle, passages, None, se["ppl_max_tokens"], se["batch_size"])["nll"]
+    cache = JsonlCache(paths(cfg, behavior).steering_dir / "side_effects_cache.jsonl")
+    settings = dict(n_mmlu=len(questions), n_ppl=len(passages), ppl_max_tokens=se["ppl_max_tokens"],
+                    batch_size=se["batch_size"], seed=cfg["seed"], behavior=behavior)
+
+    def measure(spec: SteerSpec, compute) -> tuple[np.ndarray, dict]:
+        key = f"{spec.slug()}:{_fingerprint(bundle, spec, vectors, n_ref, sae, a_ref, **settings)}"
+        if key not in cache:
+            correct, nll = compute()
+            cache.put(key, {"correct": np.asarray(correct, dtype=bool).tolist(), "nll": nll})
+        hit = cache.get(key)
+        return np.asarray(hit["correct"], dtype=bool), hit["nll"]
+
+    base_correct, base = measure(
+        SteerSpec("none", "induce"),
+        lambda: (mmlu_accuracy(bundle, questions, None, None, se["batch_size"]),
+                 nll_kl(bundle, passages, None, se["ppl_max_tokens"], se["batch_size"])))
+    base_nll = base["nll"]
 
     rows, seen = [], set()
     for spec in tqdm(specs, desc=f"side effects {behavior}"):
@@ -548,14 +607,15 @@ def run_side_effects(bundle: ModelBundle, cfg: Config, behavior: str, specs: lis
             correct, nll = base_correct, {"nll": base_nll, "kl_mean": 0.0}
         elif spec.kind == "prompt":
             # No hook: only the MMLU prompt is wrapped; raw-text NLL is unaffected by definition.
-            correct = mmlu_accuracy(bundle, questions, None, PROMPT_TEMPLATES[behavior][spec.direction], se["batch_size"])
-            nll = {"nll": base_nll, "kl_mean": 0.0}
+            wrap = PROMPT_TEMPLATES[behavior][spec.direction]
+            correct, nll = measure(spec, lambda: (mmlu_accuracy(bundle, questions, None, wrap, se["batch_size"]),
+                                                  {"nll": base_nll, "kl_mean": 0.0}))
         else:
             # Scored logits come from prompt-only passes, so "generated"-only steering is applied everywhere.
             eff = dataclasses.replace(spec, positions="all") if spec.positions == "generated" else spec
             factory = intervention(bundle, eff, vectors, n_ref, sae, a_ref)
-            correct = mmlu_accuracy(bundle, questions, factory, None, se["batch_size"])
-            nll = nll_kl(bundle, passages, factory, se["ppl_max_tokens"], se["batch_size"])
+            correct, nll = measure(eff, lambda: (mmlu_accuracy(bundle, questions, factory, None, se["batch_size"]),
+                                                 nll_kl(bundle, passages, factory, se["ppl_max_tokens"], se["batch_size"])))
         acc, lo, hi = bootstrap_rate(correct, n_boot, seed, ci)
         delta = paired_rate_delta(correct, base_correct, n_boot, seed, ci)
         rows.append({
@@ -668,13 +728,15 @@ def feature_coherence(bundle: ModelBundle, cfg: Config, behavior: str, sae: Jump
 
 
 def direction_coherence(sweep: pd.DataFrame, side: pd.DataFrame, out: Path | None = None) -> pd.DataFrame:
-    """Per vector: area under |delta_rate| vs α, and the effect at the largest α whose MMLU drop
-    ≤ 2 points. Answers: do the best detectors (probe_dir, sae_*) also steer best?"""
+    """Per vector: area under |delta_rate| vs α, from the origin (α = 0 is the unsteered run, Δ = 0),
+    and the effect at the largest α whose MMLU drop ≤ 2 points. Answers: do the best detectors (probe_dir, sae_*) also steer best?"""
     df = sweep[sweep["kind"] == "add"].merge(side[["slug", "delta_mmlu"]], on="slug", how="left")
     rows = []
     for (vector, direction), sub in df.groupby(["vector", "direction"], sort=True):
         sub = sub.assign(abs_alpha=sub["alpha"].abs()).sort_values("abs_alpha")
         a, d = sub["abs_alpha"].to_numpy(dtype=np.float64), sub["delta_rate"].abs().to_numpy(dtype=np.float64)
+        if not len(a) or a[0] != 0.0:  # α = 0 is not generated any more: add the origin explicitly
+            a, d = np.concatenate([[0.0], a]), np.concatenate([[0.0], d])
         within = sub[sub["delta_mmlu"] >= -0.02]
         best = within.iloc[-1] if len(within) else None
         rows.append({
