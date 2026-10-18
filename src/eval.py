@@ -95,9 +95,11 @@ def _auroc_samples(y, s, groups, n_boot: int, seed: int) -> np.ndarray:
 def bootstrap_auroc(y, s, groups, n_boot: int = 1000, seed: int = 0, ci: float = 0.95
                     ) -> tuple[float, float, float]:
     """Cluster bootstrap: resample unique group_ids with replacement; redraw single-class
-    resamples (raise if > 10 %). Returns (point, lo, hi) percentile CI."""
+    resamples (raise if > 10 %). Returns (point, lo, hi) percentile CI. The point uses the same
+    rank-based AUROC as the resamples, so an interval that ends at the point ends exactly there."""
+    y, s = np.asarray(y).astype(int), np.asarray(s, dtype=np.float64)
     lo, hi = _percentile_ci(_auroc_samples(y, s, groups, n_boot, seed), ci)
-    return auroc(np.asarray(y).astype(int), np.asarray(s)), lo, hi
+    return _fast_auroc(y, s), lo, hi
 
 
 def paired_delta(y, s_a, s_b, groups, n_boot: int = 1000, seed: int = 0, ci: float = 0.95) -> dict:
@@ -110,7 +112,7 @@ def paired_delta(y, s_a, s_b, groups, n_boot: int = 1000, seed: int = 0, ci: flo
         for idx in _group_resamples(y, groups, n_boot, seed)
     ])
     lo, hi = _percentile_ci(deltas, ci)
-    return {"delta": auroc(y, s_a) - auroc(y, s_b), "lo": lo, "hi": hi, "p": _two_sided_p(deltas)}
+    return {"delta": _fast_auroc(y, s_a) - _fast_auroc(y, s_b), "lo": lo, "hi": hi, "p": _two_sided_p(deltas)}
 
 
 def holm(pvals: Sequence[float]) -> list[float]:

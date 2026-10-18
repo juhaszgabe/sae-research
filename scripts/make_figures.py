@@ -39,7 +39,12 @@ def main() -> None:
             if missing:
                 log.info("%s: skipping %s (missing or empty: %s)", behavior, name, ", ".join(missing))
                 return
-            plt.close(make(fig_dir / f"{behavior}_{name}"))
+            try:
+                plt.close(make(fig_dir / f"{behavior}_{name}"))
+            except Exception as e:  # one broken figure must not stop the others
+                plt.close("all")
+                log.error("%s: could not draw %s: %s: %s", behavior, name, type(e).__name__, e)
+                return
             log.info("%s: wrote %s", behavior, fig_dir / f"{behavior}_{name}.pdf")
 
         save_run_info(cfg, fig_dir, f"make_figures_{behavior}")

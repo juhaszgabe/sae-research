@@ -43,6 +43,16 @@ def _label(method: str, width: str) -> str:
     return method if width in ("dense", "-") else f"{method} ({width})"
 
 
+def _ci_err(point, lo, hi) -> list:
+    """Error-bar lengths [below, above] for an interval around a point, clipped at zero. A percentile
+    bootstrap interval need not contain its point estimate, and when it ends exactly at it the two can
+    differ by rounding (about 1e-16); matplotlib rejects any negative length."""
+    point, lo, hi = (np.atleast_1d(np.asarray(v, dtype=np.float64)) for v in (point, lo, hi))
+    below = np.nan_to_num(np.clip(point - lo, 0.0, None))
+    above = np.nan_to_num(np.clip(hi - point, 0.0, None))
+    return [below, above]
+
+
 def _width_order(widths) -> list[str]:
     return sorted(set(widths), key=lambda w: WIDTHS.get(w, 0))
 
@@ -77,7 +87,7 @@ def plot_method_comparison(results: pd.DataFrame, comparisons: pd.DataFrame, out
     fig, ax = plt.subplots(figsize=(8, 4.5))
     for i, r in best.iterrows():
         color, marker = _style(r["method"])
-        ax.errorbar(i, r["test_auroc"], yerr=[[r["test_auroc"] - r["test_lo"]], [r["test_hi"] - r["test_auroc"]]],
+        ax.errorbar(i, r["test_auroc"], yerr=_ci_err(r["test_auroc"], r["test_lo"], r["test_hi"]),
                     fmt=marker, color=color, capsize=3, markersize=7)
         if r["key"] in headline.index:
             c = headline.loc[r["key"]]
@@ -120,7 +130,7 @@ def plot_k_curve(k_curve_df: pd.DataFrame, out: Path | None = None, logreg_band:
     for (method, width), g in k_curve_df.groupby(["method", "width"], sort=True):
         g = g.sort_values("k")
         color, marker = _style(method)
-        ax.errorbar(g["k"], g["test_auroc"], yerr=[g["test_auroc"] - g["test_lo"], g["test_hi"] - g["test_auroc"]],
+        ax.errorbar(g["k"], g["test_auroc"], yerr=_ci_err(g["test_auroc"], g["test_lo"], g["test_hi"]),
                     color=color, marker=marker, capsize=2, label=_label(method, width),
                     linestyle="-" if width in ("dense", _width_order(k_curve_df["width"])[-1]) else ":")
     if logreg_band is not None:
@@ -141,7 +151,7 @@ def plot_width(results: pd.DataFrame, out: Path | None = None) -> Figure:
         g = g.set_index("width").reindex(widths).dropna(subset=["test_auroc"])
         color, marker = _style(method)
         x = [widths.index(w) for w in g.index]
-        ax.errorbar(x, g["test_auroc"], yerr=[g["test_auroc"] - g["test_lo"], g["test_hi"] - g["test_auroc"]],
+        ax.errorbar(x, g["test_auroc"], yerr=_ci_err(g["test_auroc"], g["test_lo"], g["test_hi"]),
                     color=color, marker=marker, capsize=3, label=method)
     ax.set_xticks(range(len(widths)), widths)
     ax.set(xlabel="SAE width", ylabel="test AUROC (best layer)", title="SAE probes by dictionary width")
@@ -193,7 +203,7 @@ def plot_steering_curves(sweep: pd.DataFrame, direction: str, out: Path | None =
             g = pd.concat([none.iloc[[0]].assign(abs_alpha=0.0, vector=vector), g], ignore_index=True)
         color, marker = _style("random0" if str(vector).startswith("random") else str(vector))
         ax.errorbar(g["abs_alpha"], g["behavior_rate"],
-                    yerr=[g["behavior_rate"] - g["rate_lo"], g["rate_hi"] - g["behavior_rate"]],
+                    yerr=_ci_err(g["behavior_rate"], g["rate_lo"], g["rate_hi"]),
                     color=color, marker=marker, capsize=2, label=vector)
     if not none.empty:
         ax.axhline(none["behavior_rate"].iloc[0], color="black", linestyle=":", linewidth=0.8, label="unsteered")
@@ -230,7 +240,7 @@ def plot_shift(shift_df: pd.DataFrame, out: Path | None = None) -> Figure:
     for _, r in df.iterrows():
         color, marker = _style(r["method"])
         ax.plot([0, 1], [r["id_auroc"], r["ood_auroc"]], color=color, marker=marker, label=_label(r["method"], r["width"]))
-        ax.errorbar(1, r["ood_auroc"], yerr=[[r["ood_auroc"] - r["ood_lo"]], [r["ood_hi"] - r["ood_auroc"]]],
+        ax.errorbar(1, r["ood_auroc"], yerr=_ci_err(r["ood_auroc"], r["ood_lo"], r["ood_hi"]),
                     color=color, capsize=3)
     ax.set_xticks([0, 1], ["in-distribution (test)", "shifted"])
     ax.set_xlim(-0.3, 1.3)
