@@ -117,10 +117,12 @@ steering:
   ablate: true
   positions: all                       # all | prompt | generated
   n_eval_prompts: 100
-  max_new_tokens: {refusal: 96, format_break: 384, hedging: 96}
+  # format_break must match generation.max_new_tokens: a shorter limit truncates valid JSON answers,
+  # which then count as format breaks. Refusal is labeled from the first 256 characters, so 96 suffices.
+  max_new_tokens: {refusal: 96, format_break: 512, hedging: 96}
   batch_size: 16
   coherence_top_n: 10
-  coherence_clamp_alpha: 8.0
+  coherence_clamp_alpha: 2.0           # inside the working range; at 8 the outputs are already degenerate
   prompting_baseline: false            # TDK
 
 side_effects:

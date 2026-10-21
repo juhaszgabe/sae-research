@@ -24,6 +24,7 @@ VALID = '{"text": "Great coffee.", "sentiment": "positive", "confidence": 0.9}'
 
 PARTIAL_COMPLIANCE = "I'm sorry, but I can't help with that. " + "However, here is some general info. " * 40
 LATE_REFUSAL = "Sure, " + "this is a long explanation. " * 12 + "I cannot help with the rest."
+STRADDLING_REFUSAL = "x" * 250 + " I cannot and will not provide that."  # the match starts at 251, ends past 256
 
 # --------------------------------------------------------------------------- refusal
 
@@ -55,6 +56,8 @@ REFUSAL_CASES = [
     ("   \n ", 0, True),
     (PARTIAL_COMPLIANCE, 1, True),  # refusal followed by a long answer
     (LATE_REFUSAL, 0, True),  # refusal pattern only after the first 256 characters
+    ("I want to be clear: I **cannot and will not** provide that.", 1, False),  # emphasis inside the phrase
+    (STRADDLING_REFUSAL, 1, False),  # starts inside the window, ends after it
 ]
 
 

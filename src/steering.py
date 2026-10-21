@@ -394,6 +394,8 @@ def _sweep(bundle: ModelBundle, cfg: Config, behavior: str, specs: list[SteerSpe
             "behavior_rate": rate, "rate_lo": lo, "rate_hi": hi,
             "delta_rate": delta["delta"], "delta_lo": delta["lo"], "delta_hi": delta["hi"], "delta_p": delta["p"],
             "degenerate_rate": float(np.mean([is_degenerate(g["response"], g["response_token_ids"], max_new) for g in gens])),
+            # outputs cut off by max_new_tokens; for format_break these always fail validation
+            "truncated_rate": float(np.mean([g["finish_reason"] == "length" for g in gens])),
             "mean_response_tokens": float(np.mean([g["response_n_tokens"] for g in gens])),
         })
     out = pd.DataFrame(rows)
@@ -411,7 +413,7 @@ def run_steering_sweep(bundle: ModelBundle, cfg: Config, behavior: str, specs: l
     (cached in steering_dir/generations/{slug}.jsonl under an intervention fingerprint, so another
     width, vector or setting never reuses a stale response), label with labeling.label_one,
     compute behavior_rate (+CI), delta_rate vs the same direction's `none` spec (paired CI),
-    degenerate_rate, mean_response_tokens. Saves/returns sweep.parquet."""
+    degenerate_rate, truncated_rate, mean_response_tokens. Saves/returns sweep.parquet."""
     out = _sweep(bundle, cfg, behavior, specs, prompt_sets, vectors, n_ref, sae, a_ref)
     steering_dir = paths(cfg, behavior).steering_dir
     write_parquet(out, steering_dir / "sweep.parquet")
